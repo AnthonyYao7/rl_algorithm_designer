@@ -7,7 +7,7 @@ import graphviz as gv
 def main():
     tokens = []
 
-    with open("ansi.c.grammer.y", "r") as f:
+    with open("ansi.c.grammar.y", "r") as f:
         lines = [x.strip() for x in f.readlines()]
 
         start = 0
