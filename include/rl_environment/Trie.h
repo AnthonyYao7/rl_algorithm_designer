@@ -30,6 +30,12 @@ private:
 public:
     Trie() : root(new TrieNode()) {}
 
+    Trie(Trie&& moved) noexcept
+    {
+        this->root = moved.root;
+        moved.root = nullptr;
+    }
+
     void destructor_helper(TrieNode* t)
     {
         if (t == nullptr)
@@ -107,7 +113,10 @@ public:
             for (int i = 0; i < this->cur->num_keys; ++i)
             {
                 if (this->cur->keys[i] == option)
+                {
                     this->cur = this->cur->children[i];
+                    break;
+                }
             }
         }
 

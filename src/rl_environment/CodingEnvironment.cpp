@@ -8,13 +8,17 @@
 #include <string>
 #include <regex>
 #include <string_view>
+#include <algorithm>
+#include <sys/wait.h>
+#include <numeric>
 
 #include "rl_environment/CodingEnvironment.h"
 #include "rl_environment/Symbol.h"
 #include "rl_environment/Trie.h"
+#include "testing_harness/Tester.h"
 
 
-std::vector<std::string> split(std::string s, std::string delimiter) {
+std::vector<std::string> split(const std::string& s, const std::string& delimiter) {
     size_t pos_start = 0, pos_end, delim_len = delimiter.length();
     std::string token;
     std::vector<std::string> res;
@@ -29,19 +33,69 @@ std::vector<std::string> split(std::string s, std::string delimiter) {
     return res;
 }
 
+const int CodingEnvironment::max_children;
+const int CodingEnvironment::max_identifiers;
 
-CodingEnvironment::CodingEnvironment(const std::string& grammar_file, const std::string& lex_file)
-{
+
+CodingEnvironment::CodingEnvironment(
+        const std::string& grammar_file,
+        const std::string& lex_file,
+        int max_actions,
+        const std::string& function_name,
+        const std::string& return_type,
+        const std::vector<std::string>& param_types,
+        std::function<double(int, int, const char*)> reward_function) :
+        max_actions(max_actions),
+        reward_function(reward_function){
     /* Push on the zeroth element because we cannot use zero as a token */
     number_conversion.emplace_back();
     rules.emplace_back();
     is_terminal.emplace_back();
     resolve_strings.emplace_back();
 
+    param_count = param_types.size();
+
     /* Parse grammar file */
     parse_grammar_file(grammar_file);
 
-    rule_stack.push(get_rule(convert("translation_unit")).begin());
+    function_signature.reserve(
+            function_name.length() +
+            return_type.length() +
+            std::accumulate(
+                    param_types.begin(),
+                    param_types.end(),
+                    0,
+                    [] (int a, const std::string& b) { return a + b.length(); }) +
+            4 * param_types.size());
+
+    function_signature += return_type;
+    function_signature += ' ';
+    function_signature += function_name;
+    function_signature += '(';
+
+    // simply unrolling first iteration in order to prevent branching for the comma
+    if (param_types.size() > 0) {
+        function_signature += param_types[0];
+        function_signature += ' ';
+        function_signature += identifier_to_string((int)0);
+    }
+
+    for (unsigned int i = 1; i < param_types.size(); ++i) {
+        function_signature += ',';
+        function_signature += param_types[i];
+        function_signature += ' ';
+        function_signature += identifier_to_string((int)i);
+    }
+
+    function_signature += ')';
+    function_signature.shrink_to_fit();
+
+    code.reserve(function_signature.length() + CODE_RESERVE_FACTOR * max_actions);
+    code.append(function_signature);
+
+    identifier_count = (int)param_types.size();
+
+    init_stack();
 
     /* Parse lex file */
     parse_lex_file(lex_file);
@@ -145,10 +199,7 @@ void CodingEnvironment::parse_lex_file(const std::string &lex_file)
 
             convert_t ind = this->convert(symbol);
 
-            while (this->resolve_strings.size() <= ind)
-                this->resolve_strings.emplace_back();
-
-            this->resolve_strings[ind] = resolve_to;
+            set_resolve_action(ind, resolve_to);
         }
     }
 }
@@ -167,7 +218,14 @@ CodingEnvironment::convert_t CodingEnvironment::convert(const std::string& symbo
 
         symbol_conversion.emplace(sym, index);
         number_conversion.push_back(sym);
-        is_terminal.push_back((sym[0] >= 'A' and sym[0] <= 'Z') or sym.length() == 1);
+
+        if (sym == "IDENTIFIER")// or sym == "CONSTANT")
+            is_terminal.push_back(false);
+        else
+            is_terminal.push_back((sym[0] >= 'A' and sym[0] <= 'Z') or sym.length() == 1);
+
+        if (sym.length() == 1)
+            set_resolve_action(index, sym);
 
         return index;
     }
@@ -178,8 +236,8 @@ CodingEnvironment::convert_t CodingEnvironment::convert(const std::string& symbo
 
 std::string CodingEnvironment::revert(convert_t index) const
 {
-    if (index >= this->number_conversion.size())
-        throw std::runtime_error("Index not found in revert");
+    if (index >= (int)this->number_conversion.size())
+        return identifier_to_string(index - symbol_conversion.size() - 1);
 
     return number_conversion[index];
 }
@@ -187,7 +245,7 @@ std::string CodingEnvironment::revert(convert_t index) const
 
 CodingEnvironment::Rule& CodingEnvironment::get_rule(convert_t index)
 {
-    while (rules.size() <= index)
+    while ((int)rules.size() <= index)
         rules.emplace_back();
 
     return rules[index];
@@ -196,43 +254,97 @@ CodingEnvironment::Rule& CodingEnvironment::get_rule(convert_t index)
 
 bool CodingEnvironment::get_terminal(convert_t index) const
 {
-    if (index < is_terminal.size())
+    if (index < (int)is_terminal.size())
         return is_terminal[index];
 
     throw std::runtime_error("Index not found in get_terminal");
 }
 
 
-CodingEnvironment::ActionList CodingEnvironment::getActionSpace()
+CodingEnvironment::ActionList CodingEnvironment::get_action_space()
 {
-    if (this->rule_stack.empty())
-    {
-        std::cout << "Rule stack empty, done?" << std::endl;
+    if (in_terminal_state()) {
         return {nullptr, 0};
     }
 
-    return this->rule_stack.top().get_options();
+    if (rule_stack.top() == get_rule(convert("IDENTIFIER")).begin()) /* Very jank way of telling if the most recent action is identifier */
+    {
+        for (int i = 0; i < identifier_count; ++i)
+            identifier_list[i] = Action(symbol_conversion.size() + i + 1, true);
+
+        if (identifier_count != max_identifiers)
+            identifier_list[identifier_count] = Action(symbol_conversion.size() + identifier_count + 1, true);
+
+        return {&identifier_list, std::min(identifier_count + 1, CodingEnvironment::max_children)};
+    }
+
+    if (rule_stack.top() == get_rule(convert("CONSTANT")).begin())
+    {
+        return {nullptr, 0};
+    }
+
+    ActionList opts = rule_stack.top().get_options();
+
+    while (opts.second == 1) {
+        apply_action((*(opts.first))[0]);
+
+        if (rule_stack.empty()) break;
+
+        opts = rule_stack.top().get_options();
+    }
+
+    return opts;
 }
 
 /**
- *
  * @param action Must be a member of current action space
+ *
+ * TODO: If an action results in an action space with only one action, apply that action automatically
  */
-void CodingEnvironment::applyAction(const Action& action)
+void CodingEnvironment::apply_action(const Action& action)
 {
-    this->rule_stack.top().inc(action); /* Apply action to the most recent rule, the rule it is a part of */
+    std::cout << action.s << ' ' << action.terminal << std::endl;
 
-    if (action.terminal)
+    if (action.s == 0) /* last symbol in rule */
     {
-        this->code << ' ' << resolve_action(action);
-
-        while (this->rule_stack.top().is_end()) /* The top of the stack is a leaf node in its trie, i.e., it is the last symbol in the rule */
+        if (!rule_stack.empty())
             this->rule_stack.pop();
+        return;
     }
-    else
+
+    ++num_actions;
+
+    if (action.s > (int)symbol_conversion.size()) /* since indices start at 1 */
     {
-        this->rule_stack.emplace(get_rule(action.s).begin()); /* start of a new rule... */
+        int identifier_num = action.s - symbol_conversion.size();
+        if (identifier_num == identifier_count + 1)
+            ++identifier_count;
+
+        code += ' ';
+        code += identifier_to_string(identifier_num);
+
+        rule_stack.pop(); /* Pops off the identifier "rule" */
+        return;
     }
+
+    rule_stack.top().inc(action); /* Apply action to the most recent rule, the rule it is a part of */
+
+    if (action.terminal){
+        code += ' ';
+        code += resolve_action(action); /* Add actual string representation into code */
+//        this->code << ' ' << resolve_action(action); /* Add actual string representation into code */
+    }else{
+        rule_stack.emplace(get_rule(action.s).begin()); /* start of a new rule... */
+    }
+}
+
+
+void CodingEnvironment::set_resolve_action(CodingEnvironment::convert_t index, const std::string &resolve_to)
+{
+    while ((int)resolve_strings.size() <= index)
+        resolve_strings.emplace_back();
+
+    resolve_strings[index] = resolve_to;
 }
 
 
@@ -245,7 +357,10 @@ std::string CodingEnvironment::resolve_action(const Action& action)
     if (not action.terminal)
         return "";
 
-    if (action.s < resolve_strings.size() and resolve_strings[action.s].length() > 0)
+    if (action.s == 0)
+        return "";
+
+    if (action.s < (int)resolve_strings.size() and (int)resolve_strings[action.s].length() > 0)
         return resolve_strings[action.s];
 
     const std::string symbol_string = revert(action.s);
@@ -268,28 +383,191 @@ std::string CodingEnvironment::resolve_action(const Action& action)
         return "a";
     }
 
-    if (symbol_string == "STRING_LITERAL")
-    {
-        /**
-         * Not implemented, might never implement this
-         */
-
-        return "";
-    }
-
     return "";
 }
 
 
-std::string CodingEnvironment::get_code() const
+std::string CodingEnvironment::identifier_to_string(int id)
 {
-    return this->code.str();
+    if (id > 50)
+    {
+        throw std::runtime_error("Identifier to large");
+        exit(1);
+    }
+
+    if (id == 0)
+        return "a";
+
+    std::string ret;
+
+    while (id > 0)
+    {
+        ret += (char)(id % 26) + 'a';
+        id /= 26;
+    }
+
+    std::reverse(ret.begin(), ret.end());
+
+    return ret;
+}
+
+
+const std::string & CodingEnvironment::get_code() const
+{
+    return code;
 }
 
 
 void CodingEnvironment::reset()
 {
     rule_stack = std::stack<Rule::Iterator>();
+    init_stack();
     code.clear();
-    code.str("");
+    code += function_signature;
+    num_actions = 0;
+    identifier_count = param_count;
+}
+
+
+void CodingEnvironment::init_stack()
+{
+    const std::vector<std::string> init_state = {"translation_unit", "external_declaration", "function_definition"};
+    const int inc[4] = {1, 1, 3};
+
+    for (size_t i = 0; i < init_state.size(); ++i) {
+        const std::string& s = init_state[i];
+
+        rule_stack.push(get_rule(convert(s)).begin());
+
+        for (int j = 0; j < inc[i]; ++j) {
+            rule_stack.top().inc((*rule_stack.top().get_options().first)[0]);
+        }
+    }
+}
+
+
+bool CodingEnvironment::in_terminal_state() const {
+    return this->rule_stack.empty() or num_actions > max_actions;
+}
+
+
+CodingEnvironment::Reward CodingEnvironment::get_reward() const {
+    int prog_fd[2], gcc_err_fd[2];
+
+    if (pipe(prog_fd) == -1 or pipe(gcc_err_fd) == -1) {
+        perror("pipe");
+        exit(EXIT_FAILURE);
+    }
+
+    // print out the program
+    if (fork() == 0) {
+        close(STDOUT_FILENO);
+        dup(prog_fd[1]);
+        close(prog_fd[0]);
+        close(prog_fd[1]);
+
+        printf("%s", code.c_str());
+        exit(0);
+    }
+
+    pid_t gcc_pid;
+
+    // compile the program
+    if ((gcc_pid=fork()) == 0) {
+        close(STDIN_FILENO);
+        dup(prog_fd[0]);
+        close(prog_fd[1]);
+        close(prog_fd[0]);
+
+        close(STDERR_FILENO);
+        dup2(gcc_err_fd[1], STDERR_FILENO);
+        close(gcc_err_fd[0]);
+        close(gcc_err_fd[1]);
+
+        pid_t cur_pid = getpid();
+        std::string path = BIN_GEN_PATH + std::to_string((int) cur_pid) + ".out";
+        const char* args[] = {"gcc", "-fsanitize=address", "-static-libasan", "-g", "-o", path.c_str(), "-x", "c", "-pipe", "-"};
+        execlp(args[0], args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], NULL);
+
+        perror("gcc execlp failed");
+        exit(1);
+    }
+
+    close(prog_fd[0]);
+    close(prog_fd[1]);
+    close(gcc_err_fd[1]);
+
+    char buf[1024];
+    ssize_t bytesRead;
+    while ((bytesRead=read(gcc_err_fd[0], buf, sizeof(buf) - 1)) > 0) {
+        // TODO: Write handler for error output
+    }
+
+    close(gcc_err_fd[0]);
+
+    int status;
+    /* wait for gcc to finish running */
+    if (waitpid(gcc_pid, &status, 0) < 0) {
+        std::cout << "Wait failed\n";
+        exit(EXIT_FAILURE);
+    }
+
+    int gcc_ec=-1;
+    // TODO: Implement compile error checking
+    if (WIFEXITED(status)) {
+        switch (gcc_ec=WEXITSTATUS(status)) {
+            case 0:
+                std::cout << code << std::endl;
+                break;
+            case 1:
+                std::cout << "Did not compile\n";
+                break;
+            default:
+                std::cout << "Do not know what happened\n";
+                break;
+        }
+    } else {
+        // TODO: Handle what happens if the program does something besides exiting (loop the wait?)
+    }
+
+    /* wait for program printing process */
+    wait(nullptr);
+
+    if (gcc_ec != 0) {
+        return reward_function(gcc_ec, 0, nullptr);
+    }
+
+    /* run the generated program */
+    std::string path = BIN_GEN_PATH + std::to_string((int) gcc_pid) + ".out";
+    pid_t gen_prog_pid;
+    if ((gen_prog_pid=fork()) == 0) {
+        execlp(path.c_str(), path.c_str(), NULL);
+        exit(1);
+    }
+
+    /* wait for program to finish */
+    if (waitpid(gen_prog_pid, &status, 0) < 0) {
+        std::cout << "Wait failed\n";
+        exit(EXIT_FAILURE);
+    }
+
+    int prog_ec=-1;
+    // TODO: Same as above
+    if (WIFEXITED(status)) {
+        switch (prog_ec=WEXITSTATUS(status)) {
+            case 0:
+                std::cout << "Wow the generated program actually ran\n";
+                break;
+            case 1:
+                std::cout << "Generated program failed with exit code 1\n";
+                break;
+            default:
+                std::cout << "Not quite sure what the generated program did\n";
+                break;
+        }
+    } else {
+        // TOOD: Same as above
+    }
+
+    return reward_function(gcc_ec, prog_ec, nullptr);
 }

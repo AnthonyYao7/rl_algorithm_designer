@@ -11,8 +11,11 @@
 template <std::equality_comparable T>
 struct Symbol
 {
-    T s;
-    bool terminal;
+    T s{};
+    bool terminal{true};
+
+    Symbol() = default;
+    Symbol(T t, bool term) : s(t), terminal(term) {}
 
     bool operator == (const Symbol& rhs) const
     {
