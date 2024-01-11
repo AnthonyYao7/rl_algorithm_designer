@@ -4,6 +4,8 @@
 
 #include <fstream>
 #include <iostream>
+#include <utility>
+#include <utility>
 #include <vector>
 #include <string>
 #include <regex>
@@ -15,7 +17,6 @@
 #include "rl_environment/CodingEnvironment.h"
 #include "rl_environment/Symbol.h"
 #include "rl_environment/Trie.h"
-#include "testing_harness/Tester.h"
 
 
 std::vector<std::string> split(const std::string& s, const std::string& delimiter) {
@@ -46,7 +47,7 @@ CodingEnvironment::CodingEnvironment(
         const std::vector<std::string>& param_types,
         std::function<double(int, int, const char*)> reward_function) :
         max_actions(max_actions),
-        reward_function(reward_function){
+        reward_function(std::move(reward_function)){
     /* Push on the zeroth element because we cannot use zero as a token */
     number_conversion.emplace_back();
     rules.emplace_back();
@@ -57,48 +58,18 @@ CodingEnvironment::CodingEnvironment(
 
     /* Parse grammar file */
     parse_grammar_file(grammar_file);
-
-    function_signature.reserve(
-            function_name.length() +
-            return_type.length() +
-            std::accumulate(
-                    param_types.begin(),
-                    param_types.end(),
-                    0,
-                    [] (int a, const std::string& b) { return a + b.length(); }) +
-            4 * param_types.size());
-
-    function_signature += return_type;
-    function_signature += ' ';
-    function_signature += function_name;
-    function_signature += '(';
-
-    // simply unrolling first iteration in order to prevent branching for the comma
-    if (param_types.size() > 0) {
-        function_signature += param_types[0];
-        function_signature += ' ';
-        function_signature += identifier_to_string((int)0);
-    }
-
-    for (unsigned int i = 1; i < param_types.size(); ++i) {
-        function_signature += ',';
-        function_signature += param_types[i];
-        function_signature += ' ';
-        function_signature += identifier_to_string((int)i);
-    }
-
-    function_signature += ')';
-    function_signature.shrink_to_fit();
-
-    code.reserve(function_signature.length() + CODE_RESERVE_FACTOR * max_actions);
-    code.append(function_signature);
-
-    identifier_count = (int)param_types.size();
-
-    init_stack();
-
     /* Parse lex file */
     parse_lex_file(lex_file);
+//    init_stack();
+
+    preprocess_function_signature(function_name, return_type, param_types);
+    code.reserve(function_signature.length() + CODE_RESERVE_FACTOR * max_actions);
+//    code.append(function_signature);
+
+    preprocess_function_signature_tokenized(function_name, return_type, param_types);
+    code_tokenized.reserve(max_actions);
+
+    reset(); // (re)set
 }
 
 
@@ -106,14 +77,12 @@ void CodingEnvironment::parse_grammar_file(const std::string &grammar_file)
 {
     std::ifstream f(grammar_file);
 
-    if (not f.is_open())
-    {
+    if (not f.is_open()){
         std::cout << "Grammar file failed to open" << std::endl;
         exit(1);
     }
 
     std::string line;
-
     bool in_main_section = false;
     convert_t current_symbol;
     Rule* current_rule = nullptr;
@@ -128,30 +97,24 @@ void CodingEnvironment::parse_grammar_file(const std::string &grammar_file)
             if (line.length() == 0)
                 continue;
 
-            if (line[1] == 't') /* line = "%token ...", line[1] == 't' */
-            {
+            if (line[1] == 't'){ /* line = "%token ...", line[1] == 't' */
                 auto tokens = split(line.substr(7), " ");
 
                 for (const std::string& token : tokens)
                     convert(token);
             }
-            else if (line[1] == '%') /* line = "%%", line[1] == '%' */
-            {
+            else if (line[1] == '%'){ /* line = "%%", line[1] == '%' */
                 in_main_section = true;
             }
-        }
-        else // in_main_section
-        {
+        } else {// in_main_section
             if (line.length() == 0)
                 continue;
 
             if (line[0] == '%')
                 break;
 
-            if (line[0] == '\t')  // sequence
-            {
-                if (line[1] == ':' or line[1] == '|')
-                {
+            if (line[0] == '\t'){  // sequence
+                if (line[1] == ':' or line[1] == '|'){
                     std::string seq = line.substr(3);
                     std::vector<std::string> elements = split(seq, " ");
 
@@ -165,8 +128,7 @@ void CodingEnvironment::parse_grammar_file(const std::string &grammar_file)
                     current_rule->insert_sequence(sym_seq);
                 }
             }
-            else  // Rule symbol name
-            {
+            else{  // Rule symbol name
                 current_symbol = convert(line);
                 current_rule = &get_rule(current_symbol);
             }
@@ -175,45 +137,37 @@ void CodingEnvironment::parse_grammar_file(const std::string &grammar_file)
 }
 
 
-void CodingEnvironment::parse_lex_file(const std::string &lex_file)
-{
+void CodingEnvironment::parse_lex_file(const std::string &lex_file){
     std::ifstream lex(lex_file);
 
-    if (not lex.is_open())
-    {
+    if (not lex.is_open()){
         std::cout << "Lex file is not open" << std::endl;
         exit(1);
     }
 
     std::string line;
 
-    std::regex token_definition_pattern(R"lit("([^"\\)]+[^"\\)]+)".*\(([A-Za-z_]+)\))lit");
+    const std::regex token_definition_pattern(R"lit("([^"\\)]+[^"\\)]+)".*\(([A-Za-z_]+)\))lit");
     std::smatch match;
 
-    while (getline(lex, line))
-    {
-        if (std::regex_search(line, match, token_definition_pattern))
-        {
+    while (getline(lex, line)){
+        if (std::regex_search(line, match, token_definition_pattern)){
             std::string resolve_to = match[1];
             std::string symbol = match[2];
-
-            convert_t ind = this->convert(symbol);
-
+            convert_t ind = convert(symbol);
             set_resolve_action(ind, resolve_to);
         }
     }
 }
 
 
-CodingEnvironment::convert_t CodingEnvironment::convert(const std::string& symbol)
-{
+CodingEnvironment::convert_t CodingEnvironment::convert(const std::string& symbol){
     std::string sym = symbol;
     if (sym[0] == '\'')
         sym = sym[1];
 
     std::unordered_map<std::string, convert_t>::iterator it;
-    if ((it = symbol_conversion.find(sym)) == symbol_conversion.end())
-    {
+    if ((it = symbol_conversion.find(sym)) == symbol_conversion.end()){
         convert_t index = symbol_conversion.size() + 1;
 
         symbol_conversion.emplace(sym, index);
@@ -252,8 +206,7 @@ CodingEnvironment::Rule& CodingEnvironment::get_rule(convert_t index)
 }
 
 
-bool CodingEnvironment::get_terminal(convert_t index) const
-{
+bool CodingEnvironment::get_terminal(convert_t index) const {
     if (index < (int)is_terminal.size())
         return is_terminal[index];
 
@@ -261,8 +214,7 @@ bool CodingEnvironment::get_terminal(convert_t index) const
 }
 
 
-CodingEnvironment::ActionList CodingEnvironment::get_action_space()
-{
+CodingEnvironment::ActionList CodingEnvironment::get_action_space(){
     if (in_terminal_state()) {
         return {nullptr, 0};
     }
@@ -298,15 +250,10 @@ CodingEnvironment::ActionList CodingEnvironment::get_action_space()
 
 /**
  * @param action Must be a member of current action space
- *
- * TODO: If an action results in an action space with only one action, apply that action automatically
  */
 void CodingEnvironment::apply_action(const Action& action)
 {
-    std::cout << action.s << ' ' << action.terminal << std::endl;
-
-    if (action.s == 0) /* last symbol in rule */
-    {
+    if (action.s == 0){ /* last symbol in rule */
         if (!rule_stack.empty())
             this->rule_stack.pop();
         return;
@@ -323,6 +270,8 @@ void CodingEnvironment::apply_action(const Action& action)
         code += ' ';
         code += identifier_to_string(identifier_num);
 
+        code_tokenized.emplace_back(identifier_num);
+
         rule_stack.pop(); /* Pops off the identifier "rule" */
         return;
     }
@@ -332,7 +281,8 @@ void CodingEnvironment::apply_action(const Action& action)
     if (action.terminal){
         code += ' ';
         code += resolve_action(action); /* Add actual string representation into code */
-//        this->code << ' ' << resolve_action(action); /* Add actual string representation into code */
+
+        code_tokenized.emplace_back(action.s);
     }else{
         rule_stack.emplace(get_rule(action.s).begin()); /* start of a new rule... */
     }
@@ -365,55 +315,34 @@ std::string CodingEnvironment::resolve_action(const Action& action)
 
     const std::string symbol_string = revert(action.s);
 
-    if (symbol_string == "CONSTANT")
-    {
-        /**
-         * Not implemented
-         */
-
+    if (symbol_string == "CONSTANT"){
         return "1";
-    }
-
-    if (symbol_string == "IDENTIFIER")
-    {
-        /**
-         * Not implemented
-         */
-
-        return "a";
     }
 
     return "";
 }
 
 
-std::string CodingEnvironment::identifier_to_string(int id)
-{
-    if (id > 50)
-    {
+std::string CodingEnvironment::identifier_to_string(int id){
+    if (id > 50){
         throw std::runtime_error("Identifier to large");
-        exit(1);
     }
 
     if (id == 0)
         return "a";
 
     std::string ret;
-
-    while (id > 0)
-    {
-        ret += (char)(id % 26) + 'a';
+    while (id > 0){
+        ret += (id % 26) + 'a';
         id /= 26;
     }
 
     std::reverse(ret.begin(), ret.end());
-
     return ret;
 }
 
 
-const std::string & CodingEnvironment::get_code() const
-{
+const std::string & CodingEnvironment::get_code() const{
     return code;
 }
 
@@ -422,15 +351,22 @@ void CodingEnvironment::reset()
 {
     rule_stack = std::stack<Rule::Iterator>();
     init_stack();
+
     code.clear();
     code += function_signature;
+
+    code_tokenized.clear();
+    code_tokenized.insert(
+            std::end(code_tokenized),
+            std::begin(function_signature_tokenized),
+            std::end(function_signature_tokenized));
+
     num_actions = 0;
     identifier_count = param_count;
 }
 
 
-void CodingEnvironment::init_stack()
-{
+void CodingEnvironment::init_stack() {
     const std::vector<std::string> init_state = {"translation_unit", "external_declaration", "function_definition"};
     const int inc[4] = {1, 1, 3};
 
@@ -566,8 +502,94 @@ CodingEnvironment::Reward CodingEnvironment::get_reward() const {
                 break;
         }
     } else {
-        // TOOD: Same as above
+        // TODO: Same as above
     }
 
     return reward_function(gcc_ec, prog_ec, nullptr);
+}
+
+void CodingEnvironment::preprocess_function_signature(const std::string &function_name, const std::string &return_type,
+                                                      const std::vector<std::string> &param_types) {
+    function_signature.reserve(
+            function_name.length() +
+            return_type.length() +
+            std::accumulate(
+                    param_types.begin(),
+                    param_types.end(),
+                    0,
+                    [] (int a, const std::string& b) { return a + b.length(); }) +
+            4 * param_types.size());
+
+    function_signature += parse_type(return_type);
+    function_signature += ' ';
+    function_signature += function_name;
+    function_signature += '(';
+
+    // simply unrolling first iteration in order to prevent branching for the comma
+    if (!param_types.empty()) {
+
+        function_signature += parse_type(param_types[0]);
+        function_signature += ' ';
+        function_signature += identifier_to_string((int)0);
+    }
+
+    for (unsigned int i = 1; i < param_types.size(); ++i) {
+        function_signature += ',';
+        function_signature += parse_type(param_types[i]);
+        function_signature += ' ';
+        function_signature += identifier_to_string((int)i);
+    }
+
+    function_signature += ')';
+    function_signature.shrink_to_fit();
+}
+
+void CodingEnvironment::preprocess_function_signature_tokenized(const std::string &function_name,
+                                                                const std::string &return_type,
+                                                                const std::vector<std::string> &param_types) {
+    function_signature_tokenized.reserve(3 + 2 * param_types.size());
+
+    function_signature_tokenized.emplace_back(convert(return_type));
+    function_signature_tokenized.emplace_back(FUNCTION_TOKEN_VALUE);
+    function_signature_tokenized.emplace_back(convert("("));
+
+    if (!param_types.empty()) {
+        parse_type_token(param_types[0]);
+        function_signature_tokenized.emplace_back(symbol_conversion.size() + 1);
+    }
+
+    for (int i = 1; i < param_types.size(); ++i) {
+        function_signature_tokenized.emplace_back(convert(","));
+        parse_type_token(param_types[i]);
+    }
+
+    function_signature_tokenized.emplace_back(convert(")"));
+
+    function_signature_tokenized.shrink_to_fit();
+}
+
+const std::vector<CodingEnvironment::Token> & CodingEnvironment::get_observations() {
+    return code_tokenized;
+}
+
+std::string CodingEnvironment::parse_type(const std::string &type_name) {
+    return resolve_action({
+        convert(
+                type_name.back() == ']' ?
+                type_name.substr(0, type_name.size() - 2) :
+                type_name),
+        true
+    }) + (type_name.back() == ']' ? "[]" : "");
+}
+
+void CodingEnvironment::parse_type_token(const std::string &type_name) {
+    if (type_name.back() == ']') {
+        function_signature_tokenized.emplace_back(
+            convert(
+            type_name.substr(0, type_name.size() - 2)));
+        function_signature_tokenized.emplace_back(convert("["));
+        function_signature_tokenized.emplace_back(convert("]"));
+    } else {
+        function_signature_tokenized.emplace_back(convert(type_name));
+    }
 }

@@ -10,7 +10,7 @@
 
 #include "rl_environment/CodingEnvironment.h"
 
-#define NUM_WALKS 10
+#define NUM_WALKS 1
 #define NUM_ITERS 1000000
 
 namespace fs = std::filesystem;
@@ -42,7 +42,7 @@ double reward_function(int gcc_ec, int prog_ec, const char* gcc_logs) {
 CodingEnvironment::Action choose_random_action(CodingEnvironment& env)
 {
     static std::random_device rd;
-    static std::mt19937 gen(rd());
+    static std::mt19937 gen(2);
     static std::uniform_int_distribution<> dis(0, 20);
 
     auto [action_list, num_actions] = env.get_action_space();
@@ -80,15 +80,14 @@ void randomly_walk(CodingEnvironment& env, int num_iterations, int walk_num)
 }
 
 
-
 int main() {
     CodingEnvironment env(
             "../../viz/c_grammar_subset.y",
             "../../viz/ansi.c.grammar.l",
             10000,
             "main",
-            "int",
-            {"int"},
+            "LONG",
+            {"LONG[]", "LONG"},
             reward_function);
 
 //    bool running = true;
@@ -123,7 +122,15 @@ int main() {
     for (int i = 0; i < NUM_WALKS; ++i)
     {
         randomly_walk(env, NUM_ITERS, i);
-        std::cout << env.get_reward() << '\n';
+//        std::cout << env.get_reward() << '\n';
+        const auto& obs = env.get_observations();
+
+        for (const auto& ob : obs) {
+            std::cout << ob << ' ';
+        }
+        std::cout << '\n' << env.get_code();
+        std::cout << "\n\n\n";
+
         env.reset();
     }
 }

@@ -17,7 +17,10 @@
 #include "Trie.h"
 
 #define BIN_GEN_PATH "../../binaries/"
+#define ENV_BIN_PATH "../../env_binaries"
 #define CODE_RESERVE_FACTOR 1
+#define FUNCTION_TOKEN_VALUE 1000
+#define COMPILE_FLAGS "-g", "-Wall", "-Wuninitialized", "-fsanitize=address", "-static-libasan"
 
 class CodingEnvironment {
 public:
@@ -29,8 +32,7 @@ public:
     typedef Symbol<convert_t> Action;
     typedef std::pair<const std::array<Action, max_children>*, int> ActionList;
     typedef double Reward;
-
-    std::string function_signature;
+    typedef uint16_t Token;
 
 private:
     std::unordered_map<std::string, convert_t> symbol_conversion;
@@ -48,9 +50,13 @@ private:
     int max_actions;
     int num_actions{};
 
+    std::string function_signature;
+    std::vector<Token> function_signature_tokenized;
+
     std::stack<Rule::Iterator> rule_stack;
 //    std::stringstream code; // the exciting part
     std::string code;
+    std::vector<Token> code_tokenized;
 
     std::function<double(int, int, const char*)> reward_function;
 
@@ -66,6 +72,19 @@ public:
 
     void parse_grammar_file(const std::string& grammar_file);
     void parse_lex_file(const std::string& lex_file);
+
+    void preprocess_function_signature(
+            const std::string& function_name,
+            const std::string& return_type,
+            const std::vector<std::string>& param_types);
+
+    void preprocess_function_signature_tokenized(
+            const std::string& function_name,
+            const std::string& return_type,
+            const std::vector<std::string>& param_types);
+
+    std::string parse_type(const std::string& type_name);
+    void parse_type_token(const std::string& type_name);
 
     convert_t convert(const std::string& symbol);
     std::string revert(convert_t index) const;
@@ -90,7 +109,7 @@ public:
      * This potentially could be the program, written in postfix order with some a one hot representation for the tokens
      * pop it into a transformer and ur done
      * */
-    // std::vector<Observation> getObservations();
+    const std::vector<CodingEnvironment::Token> & get_observations();
 
     /*
      * ideas:
@@ -107,6 +126,7 @@ public:
      * */
 
      Reward get_reward() const;
+
 
 };
 
